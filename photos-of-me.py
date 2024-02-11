@@ -8,7 +8,7 @@ import time
 import urllib.parse
 from pathlib import Path
 from typing import List, NamedTuple
-
+import traceback
 
 import click
 import dateutil.parser
@@ -20,6 +20,7 @@ from selenium.common.exceptions import NoSuchElementException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait as Wait
+from urllib.parse import urlparse, parse_qs
 
 logging.basicConfig(
     level=logging.INFO,
@@ -224,21 +225,26 @@ def get_media_details(driver: webdriver.Chrome, url: str) -> Media:
     Can be a photo or video.
     """
     driver.get(url)
-    if driver.find_elements_by_link_text("View Full Size"):
+    fbid = parse_qs(urlparse(url).query).get("fbid", [None])[0]
+    og_type = driver.find_element_by_css_selector(
+        'head > meta[property="og:type"]'
+    ).get_attribute("content")
+    if not og_type.startswith("video"):
         return Media(
             type="photo",
-            actor=driver.find_element_by_css_selector("strong.actor").text,
-            caption=driver.find_element_by_xpath(
-                "//div[@id='voice_replace_id']/.."
-            ).text,
+            actor=driver.find_element_by_css_selector("a > strong").text,
+            caption=driver.find_element_by_css_selector("div.msg > div").text
+            + "\nDownloaded from Facebook fbid={}".format(fbid),
             date=driver.find_element_by_css_selector("abbr").text,
-            full_size_url=driver.find_element_by_link_text(
-                "View Full Size"
-            ).get_attribute("href"),
+            # Is this getting full size? We could follow 'head > link[p="canonical"]' and download from there?
+            full_size_url=driver.find_element_by_css_selector(
+                'head > meta[property="og:image"]'
+            ).get_attribute("content"),
             # We need cookies for authenticated requests ;)
             cookies=driver.get_cookies(),
         )
     else:
+        # Video export broken as of 2024-02-11
         return Media(
             type="video",
             actor=driver.find_element_by_css_selector("strong > a").text,
@@ -285,7 +291,11 @@ def process_photo_page_queue(cookies: list, directory: str, wait: bool):
         except NoSuchElementException:
             # This is raised if a photo page doesn't contain media details.
             # Ignore, and move on to next item in queue.
-            logging.error("Error scraping details from photo page %s", page)
+            logging.error(
+                "Error scraping details from photo page %s: %s",
+                page,
+                traceback.format_exc(),
+            )
             continue
         if media.type == "photo":
             try:
@@ -302,7 +312,8 @@ def process_photo_page_queue(cookies: list, directory: str, wait: bool):
 def download_photo(photo: Media, directory: str) -> None:
     """Downloads `photo` to `directory`."""
     # Get the REAL photo URL!
-    url = get_photo_url(photo.full_size_url, photo.cookies)
+    # url = get_photo_url(photo.full_size_url, photo.cookies)
+    url = photo.full_size_url
     # Extract a suitable media filename from the URL.
     filename = Path(urllib.parse.urlparse(url).path).name
     photo_path = Path(directory) / filename
@@ -310,7 +321,12 @@ def download_photo(photo: Media, directory: str) -> None:
     if not photo_path.exists():
         photo_content = requests.get(url).content
         photo_path.open(mode="wb").write(
-            with_exif_data(photo_content, photo.actor, photo.caption, photo.date)
+            with_exif_data(
+                photo=photo_content,
+                actor=photo.actor,
+                caption=photo.caption,
+                date=photo.date,
+            )
         )
         logging.info("Wrote photo to %s", photo_path)
     else:
